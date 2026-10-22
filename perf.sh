@@ -17,8 +17,9 @@ show_usage() {
     echo "选项:"
     echo "  -e, --event EVENT   指定 perf 采样事件 (默认: $DEFAULT_EVENT)"
     echo "                      例: cpu-clock, cycles, cache-misses, sched:sched_switch"
-    echo "  -t, --thread N      指定线程号 N, 自动查找名称为 <PATTERN>/N 的线程 (如 PROTO_IO/3),"
-    echo "                      获取其 TID 进行采样, 别名自动设为 T<N>"
+    echo "  -t, --thread N      指定线程号 N, 自动查找线程名完全等于 <PATTERN>/N 的线程"
+    echo "                      (如 PROTO_IO/3, 不会匹配 DUPROTO_IO/3), 获取其 TID 进行采样,"
+    echo "                      别名自动设为 T<N>"
     echo "                      PATTERN 可选, 默认: PROTO_IO"
     echo ""
     echo "Examples:"
@@ -35,21 +36,23 @@ show_usage() {
     exit 1
 }
 
-# 按线程号查找 TID: 线程名匹配 PATTERN 且以 /N 结尾 (如 PROTO_IO/3), 且 rss > 0
+# 按线程号查找 TID: 线程名必须完全等于 PATTERN/N (如 PROTO_IO/3, 不匹配 DUPROTO_IO/3), 且 rss > 0
 # 匹配不到或匹配到多个时报错并列出候选线程
 resolve_thread() {
     N=$1
     PATTERN=$2
 
+    # 全字符匹配: comm 必须严格等于 "PATTERN/N"
     LINE=$(ps -eLo tid,pid,psr,comm,rss | awk -v pat="$PATTERN" -v n="$N" \
-        '$5 > 0 && $4 ~ pat && $4 ~ ("/" n "$")')
+        '$5 > 0 && $4 == (pat "/" n)')
 
     COUNT=$(echo "$LINE" | grep -c .)
 
     if [ "$COUNT" -eq 0 ]; then
-        echo "Error: 未找到线程号为 $N 的线程 (pattern: $PATTERN)"
+        echo "Error: 未找到线程号为 $N 的线程 (pattern: $PATTERN, 要求线程名完全等于 $PATTERN/$N)"
         echo "当前可用线程:"
-        ps -eLo tid,pid,psr,comm,rss | awk -v pat="$PATTERN" '$5 > 0 && $4 ~ pat {print $4}' | sort -u
+        ps -eLo tid,pid,psr,comm,rss | awk -v pat="$PATTERN" \
+            '$5 > 0 && index($4, pat "/") == 1 {print $4}' | sort -u
         exit 1
     fi
 
