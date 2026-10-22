@@ -2,7 +2,10 @@
 # 用法:
 #  采样单个线程: ./perf-flame.sh [-e EVENT] <TID> [ALIAS]
 #  按线程号采样: ./perf-flame.sh [-e EVENT] -t <N> [PATTERN]  # 别名自动为 T<N>
-#  生成差分火焰图: ./perf-flame.sh -d <基线.data> <新.data>
+#  生成差分火焰图: ./perf-flame.sh -d <基线.folded> <新.folded>
+#
+# 采样后立即折叠保存为 .folded (符号已解析), 不保留原始 .data,
+# 这样即使之后模块重载/机器重启, 也能正常生成 diff 火焰图
 #
 # 默认采样事件
 DEFAULT_EVENT="cpu-clock"
@@ -12,7 +15,7 @@ show_usage() {
     echo "用法:"
     echo "  采样并生成火焰图: $0 [-e EVENT] <TID> [ALIAS]"
     echo "  按线程号采样:     $0 [-e EVENT] -t <N> [PATTERN]"
-    echo "  生成差分火焰图:   $0 -d <baseline.data> <latest.data>"
+    echo "  生成差分火焰图:   $0 -d <baseline.folded> <latest.folded>"
     echo ""
     echo "选项:"
     echo "  -e, --event EVENT   指定 perf 采样事件 (默认: $DEFAULT_EVENT)"
@@ -29,7 +32,7 @@ show_usage() {
     echo "  $0 -t 3                    # 查找 PROTO_IO/3 线程并采样, 别名 T3"
     echo "  $0 -t 3 WORKER             # 查找 WORKER.../3 线程并采样, 别名 T3"
     echo "  $0 -e cache-misses -t 5    # 使用 cache-misses 事件采样线程号5"
-    echo "  $0 -d perf-io-thread.data perf-io-thread.data # 对比时自动识别别名"
+    echo "  $0 -d perf-io-thread.folded perf-io-thread.folded # 对比时自动识别别名"
     echo ""
     echo "  ALIAS: 给线程起个别名, 方便在对比时识别 (不保存)"
     echo "  查看可用事件: perf list"
@@ -65,27 +68,26 @@ resolve_thread() {
     echo "$LINE" | awk '{print $1}'
 }
 
-# 生成差分火焰图
+# 生成差分火焰图: 输入为两个已折叠的 .folded 文件
 gen_diff() {
     BASELINE=$1
     LATEST=$2
 
-    if [ ! -f "$BASELINE" ]; then
-        echo "Error: Baseline file not found: $BASELINE"
-        exit 1
-    fi
-    if [ ! -f "$LATEST" ]; then
-        echo "Error: Latest file not found: $LATEST"
-        exit 1
-    fi
+    # .folded 必须存在且非空 (空文件会让 difffolded.pl -n 除以零崩溃)
+    for f in "$BASELINE" "$LATEST"; do
+        if [ ! -s "$f" ]; then
+            echo "Error: folded file not found or empty: $f"
+            exit 1
+        fi
+    done
 
     echo "Generating diff flame graph..."
     echo "  Baseline: $BASELINE"
     echo "  Latest:   $LATEST"
 
     # 从文件名中提取前缀（别名或TID），去掉时间戳部分
-    BASELINE_PREFIX=$(basename "$BASELINE" .data | sed 's/perf-//' | sed 's/-[0-9]\{8\}_[0-9]\{6\}$//')
-    LATEST_PREFIX=$(basename "$LATEST" .data | sed 's/perf-//' | sed 's/-[0-9]\{8\}_[0-9]\{6\}$//')
+    BASELINE_PREFIX=$(basename "$BASELINE" .folded | sed 's/perf-//' | sed 's/-[0-9]\{8\}_[0-9]\{6\}$//')
+    LATEST_PREFIX=$(basename "$LATEST" .folded | sed 's/perf-//' | sed 's/-[0-9]\{8\}_[0-9]\{6\}$//')
 
     # 提取时间戳
     BASELINE_TS=$(echo "$BASELINE" | grep -o '[0-9]\{8\}_[0-9]\{6\}' | head -1)
@@ -110,19 +112,16 @@ gen_diff() {
 
     echo "Output file: $OUTPUT"
 
-    # 解析并折叠
-    perf script -i "$BASELINE" | ./FlameGraph/stackcollapse-perf.pl > /tmp/baseline.folded
-    perf script -i "$LATEST" | ./FlameGraph/stackcollapse-perf.pl > /tmp/latest.folded
-
-    # 生成差分火焰图
-    ./FlameGraph/difffolded.pl /tmp/baseline.folded /tmp/latest.folded | \
+    # 直接对折叠文件做差分
+    # -n: 把 baseline 的样本数按 (latest 总数 / baseline 总数) 归一化,
+    #     这样比较的是"占比变化"而不是绝对样本数变化 (两次采样总量常常不同)
+    ./FlameGraph/difffolded.pl -n "$BASELINE" "$LATEST" | \
         ./FlameGraph/flamegraph.pl > "$OUTPUT"
 
-    # 清理临时文件
-    rm -f /tmp/baseline.folded /tmp/latest.folded
-
     echo "✅ Diff flame graph generated: $OUTPUT"
-    echo "  Red = increased, Blue = decreased"
+    echo "  宽度 = latest 的样本数 (不是 delta), 颜色 = latest - baseline (已归一化)"
+    echo "  Red = increased, Blue = decreased, White = unchanged"
+    echo "  颜色只反映该帧作为叶子(自身耗时)的样本变化, 不含子调用"
 }
 
 # 采样并生成火焰图
@@ -148,6 +147,7 @@ gen_normal() {
 
     TS=$(date +%Y%m%d_%H%M%S)
     DATA_FILE="perf-${PREFIX}-${TS}.data"
+    FOLDED_FILE="perf-${PREFIX}-${TS}.folded"
 
     # 采样
     perf record -o "$DATA_FILE" -e "$EVENT" --proc-map-timeout 10 -g -t "$TID" sleep 10
@@ -156,15 +156,25 @@ gen_normal() {
         exit 1
     fi
 
+    # 立即解析并折叠: 符号在当前系统状态下解析, 之后模块重载/重启不影响 diff
+    echo "Folding stacks..."
+    perf script -i "$DATA_FILE" | ./FlameGraph/stackcollapse-perf.pl > "$FOLDED_FILE"
+    if [ ! -s "$FOLDED_FILE" ]; then
+        echo "Error: 折叠结果为空 (线程可能空闲, 未采到样本), 保留原始数据: $DATA_FILE"
+        rm -f "$FOLDED_FILE"
+        exit 1
+    fi
+
+    # 折叠成功后不再保留原始 data
+    rm -f "$DATA_FILE"
+
     echo "Generating flame graph..."
 
     # 生成火焰图
-    perf script -i "$DATA_FILE" | \
-        ./FlameGraph/stackcollapse-perf.pl | \
-        ./FlameGraph/flamegraph.pl > "perf-${PREFIX}-${TS}.svg"
+    ./FlameGraph/flamegraph.pl < "$FOLDED_FILE" > "perf-${PREFIX}-${TS}.svg"
 
     echo "🔥 Flame graph generated: perf-${PREFIX}-${TS}.svg"
-    echo "  Data file saved: $DATA_FILE"
+    echo "  Folded file saved: $FOLDED_FILE"
 }
 
 # 主逻辑
@@ -176,7 +186,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -d|--diff)
             if [ $# -ne 3 ]; then
-                echo "Error: -d requires two .data files"
+                echo "Error: -d requires two .folded files"
                 show_usage
             fi
             gen_diff "$2" "$3"
